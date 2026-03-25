@@ -48,4 +48,8 @@ def end_ide_session():
     state.add_log("Teacher | Ended IDE session")
     
     if status_callback:
+<<<<<<< HEAD
         status_callback("No active session", "gray")
+=======
+        status_callback("No active session", "gray")
+>>>>>>> origin/main
