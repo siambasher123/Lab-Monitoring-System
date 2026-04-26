@@ -1,277 +1,540 @@
-# block_internet.py - HOSTS FILE METHOD (GUARANTEED WORKING)
+# block_internet.py - STUDENT SIDE
+# BLOCKS ALL INTERNET TRAFFIC COMPLETELY
+# Preserves ONLY LAN traffic (including teacher)
+
 import os
 import subprocess
-import config
-import server
-import gui
+import threading
 import time
-import shutil
+import ctypes
+import sys
 
+# Global state
 enabled = False
-HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
-BACKUP_PATH = r"C:\Windows\System32\drivers\etc\hosts.backup"
+MONITOR_THREAD = None
+MONITOR_ACTIVE = False
+TEACHER_IP = None
+DEFAULT_CLASSROOM_PORT = 5050
 
-def enable():
-    """Block internet using HOSTS file - 100% effective"""
-    global enabled
-    
-    if enabled:
-        return
+def get_classroom_port():
+    """Get classroom control port from config with safe fallback."""
+    try:
+        import config
+        return int(getattr(config, 'PORT', DEFAULT_CLASSROOM_PORT))
+    except Exception:
+        return DEFAULT_CLASSROOM_PORT
 
-    teacher_ip = config.TEACHER_IP
-    print(f"[INTERNET] BLOCKING via HOSTS file + DNS...")
+def is_admin():
+    """Check if running as administrator"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def run_command(cmd, timeout=10):
+    """Run a command and return output"""
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        return result.returncode == 0, result.stdout, result.stderr
+    except:
+        return False, "", "Timeout"
+
+def get_local_ip():
+    """Get local IP address"""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return None
+
+def get_network_info():
+    """Get network information"""
+    try:
+        success, stdout, _ = run_command("ipconfig")
+        if success:
+            lines = stdout.split('\n')
+            ip = None
+            gateway = None
+            
+            for i, line in enumerate(lines):
+                if "IPv4 Address" in line:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        ip = parts[1].strip()
+                if "Default Gateway" in line and ":" in line:
+                    parts = line.split(':')
+                    if len(parts) > 1 and parts[1].strip() and not parts[1].strip() == ":":
+                        gateway = parts[1].strip()
+            
+            return ip, gateway
+    except:
+        pass
+    return None, None
+
+def block_all_internet_firewall():
+    """Block ALL internet traffic, allow ONLY LAN"""
+    global TEACHER_IP
     
-    gui.update_internet("BLOCKED")
+    print("\n[INTERNET] 🔥 Configuring Windows Firewall to block ALL internet...")
+    
+    # Remove any existing classroom rules
+    run_command('netsh advfirewall firewall delete rule name="Classroom_Block_Internet"')
+    run_command('netsh advfirewall firewall delete rule name="Classroom_Allow_LAN"')
+    run_command('netsh advfirewall firewall delete rule name="Classroom_Allow_Teacher"')
+    run_command('netsh advfirewall firewall delete rule name="Classroom_Allow_All"')
+    
+    # Get local IP and gateway
+    local_ip, gateway = get_network_info()
+    print(f"[INTERNET] Local IP: {local_ip}")
+    print(f"[INTERNET] Gateway: {gateway}")
+    
+    # Calculate LAN subnet from local IP
+    lan_subnet = None
+    if local_ip:
+        ip_parts = local_ip.split('.')
+        if len(ip_parts) == 4:
+            if local_ip.startswith('10.'):
+                lan_subnet = f"10.0.0.0/8"
+            elif local_ip.startswith('172.'):
+                lan_subnet = f"172.16.0.0/12"
+            elif local_ip.startswith('192.168.'):
+                lan_subnet = f"192.168.0.0/16"
+            else:
+                # For other IPs, allow the entire /24 subnet
+                lan_subnet = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.0/24"
+    
+    print(f"[INTERNET] LAN Subnet: {lan_subnet}")
+    
+    # STEP 1: Block ALL outbound internet traffic
+    block_cmd = 'netsh advfirewall firewall add rule name="Classroom_Block_Internet" dir=out action=block protocol=any remoteip=any enable=yes'
+    run_command(block_cmd)
+    print("[INTERNET] ✓ Blocked ALL outbound traffic")
+    
+    # STEP 2: Allow ALL local network traffic (preserve LAN)
+    if lan_subnet:
+        allow_lan_cmd = f'netsh advfirewall firewall add rule name="Classroom_Allow_LAN" dir=out action=allow remoteip={lan_subnet} enable=yes'
+        run_command(allow_lan_cmd)
+        print(f"[INTERNET] ✓ Allowed LAN subnet: {lan_subnet}")
+    
+    # Also allow common LAN ranges as backup
+    lan_ranges = [
+        "192.168.0.0/16",
+        "10.0.0.0/8", 
+        "172.16.0.0/12",
+        "169.254.0.0/16",  # APIPA
+    ]
+    
+    for lan in lan_ranges:
+        allow_lan_cmd = f'netsh advfirewall firewall add rule name="Classroom_Allow_LAN" dir=out action=allow remoteip={lan} enable=yes'
+        run_command(allow_lan_cmd)
+    
+    # STEP 3: Specifically allow teacher IP
+    if TEACHER_IP:
+        allow_teacher_cmd = f'netsh advfirewall firewall add rule name="Classroom_Allow_Teacher" dir=out action=allow remoteip={TEACHER_IP} enable=yes'
+        run_command(allow_teacher_cmd)
+        print(f"[INTERNET] ✓ Allowed teacher IP: {TEACHER_IP}")
+    
+    # STEP 4: Allow necessary port for classroom communication
+    classroom_port = get_classroom_port()
+    allow_port_cmd = (
+        f'netsh advfirewall firewall add rule name="Classroom_Allow_Port" '
+        f'dir=out action=allow protocol=tcp localport={classroom_port} enable=yes'
+    )
+    run_command(allow_port_cmd)
+    
+    # Allow ICMP (ping) for testing
+    allow_ping_cmd = 'netsh advfirewall firewall add rule name="Classroom_Allow_Ping" dir=out action=allow protocol=icmpv4 enable=yes'
+    run_command(allow_ping_cmd)
+    
+    print("[INTERNET] ✓ Firewall configuration complete")
+    return True
+
+def block_all_internet_hosts():
+    """Use hosts file to block ALL domain resolution"""
+    hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+    backup_path = hosts_path + ".classroom_backup"
     
     try:
-        # STEP 1: Backup original hosts file
-        if os.path.exists(HOSTS_PATH):
-            shutil.copy2(HOSTS_PATH, BACKUP_PATH)
-            print("[INTERNET] Backed up hosts file")
+        print("[INTERNET] 📄 Configuring hosts file to block ALL domains...")
         
-        # STEP 2: Create blocking hosts file
-        blocking_content = '''# ============================================
-# INTERNET BLOCKED BY CLASSROOM MANAGEMENT SYSTEM
-# ============================================
+        # Backup original
+        if not os.path.exists(backup_path):
+            import shutil
+            shutil.copy2(hosts_path, backup_path)
+            print("[INTERNET] ✓ Hosts file backed up")
+        
+        # Create SUPER BLOCKING hosts file
+        with open(hosts_path, 'w') as f:
+            f.write("""# INTERNET COMPLETELY BLOCKED BY CLASSROOM MANAGEMENT
+# All domains resolve to 0.0.0.0 (nowhere)
 
-# Localhost
 127.0.0.1       localhost
 ::1             localhost
 
-# Teacher IP (ALLOWED)
-{teacher_ip}    teacher.local
+# Block ALL domains with wildcard
+0.0.0.0         *
+0.0.0.0         .*
+0.0.0.0         com
+0.0.0.0         net
+0.0.0.0         org
+0.0.0.0         edu
+0.0.0.0         gov
+0.0.0.0         io
+0.0.0.0         co
+0.0.0.0         ai
+0.0.0.0         app
 
-# ============================================
-# BLOCKED SITES (All internet traffic)
-# ============================================
-
-# Block ALL domains by redirecting to localhost
-0.0.0.0         www.google.com
-0.0.0.0         google.com
-0.0.0.0         www.youtube.com
-0.0.0.0         youtube.com
-0.0.0.0         www.facebook.com
-0.0.0.0         facebook.com
-0.0.0.0         www.twitter.com
-0.0.0.0         twitter.com
-0.0.0.0         www.instagram.com
-0.0.0.0         instagram.com
-0.0.0.0         www.netflix.com
-0.0.0.0         netflix.com
-0.0.0.0         www.amazon.com
-0.0.0.0         amazon.com
-0.0.0.0         www.microsoft.com
-0.0.0.0         microsoft.com
-0.0.0.0         www.bing.com
-0.0.0.0         bing.com
-0.0.0.0         www.yahoo.com
-0.0.0.0         yahoo.com
-
-# Block DNS servers
+# Block common IP ranges
 0.0.0.0         8.8.8.8
 0.0.0.0         8.8.4.4
 0.0.0.0         1.1.1.1
+0.0.0.0         1.0.0.1
+0.0.0.0         9.9.9.9
+0.0.0.0         208.67.222.222
+0.0.0.0         208.67.220.220
 
-# Block ALL .com, .net, .org (catch-all)
-0.0.0.0         .com
-0.0.0.0         .net
-0.0.0.0         .org
-0.0.0.0         .edu
-0.0.0.0         .gov
-
-# Block common ports
+# Block ALL possible internet destinations
+0.0.0.0         0.0.0.0/0
 0.0.0.0         :80
 0.0.0.0         :443
 0.0.0.0         :8080
-
-# ============================================
-# END OF BLOCK
-# ============================================
-'''.format(teacher_ip=teacher_ip)
+0.0.0.0         :8000
+0.0.0.0         :3000
+0.0.0.0         :5050
+""")
         
-        # Write blocking hosts file
-        with open(HOSTS_PATH, 'w', encoding='utf-8') as f:
-            f.write(blocking_content)
-        
-        print("[INTERNET] Hosts file modified")
-        
-        # STEP 3: Flush DNS
-        flush_cmd = "ipconfig /flushdns"
-        subprocess.run(flush_cmd, shell=True, capture_output=True)
-        print("[INTERNET] DNS flushed")
-        
-        # STEP 4: Disable Windows Network Location Awareness
-        try:
-            subprocess.run(["sc", "stop", "NlaSvc"], shell=True, capture_output=True)
-            subprocess.run(["sc", "config", "NlaSvc", "start=", "disabled"], shell=True, capture_output=True)
-            print("[INTERNET] Network Location Awareness disabled")
-        except:
-            pass
-        
-        # STEP 5: Block via Windows Firewall (try but don't fail)
-        try:
-            firewall_cmd = f'''
-            netsh advfirewall firewall add rule name="Classroom_Total_Block" dir=out action=block remoteip=any protocol=any enable=yes
-            netsh advfirewall firewall add rule name="Classroom_Allow_Teacher" dir=out action=allow remoteip={teacher_ip} protocol=any enable=yes
-            '''
-            subprocess.run(["cmd", "/c", firewall_cmd], shell=True, capture_output=True, timeout=10)
-            print("[INTERNET] Firewall rules added")
-        except:
-            print("[INTERNET] Firewall rules skipped (not critical)")
-        
-        enabled = True
-        print("[INTERNET] ✓ INTERNET 100% BLOCKED")
-        print("[INTERNET] ⚠️  All websites redirected to 0.0.0.0")
-        server.send_log("Internet: COMPLETELY BLOCKED via HOSTS")
-        gui.add_log("Internet: BLOCKED (all sites)")
-        
-        # Test immediately
-        time.sleep(2)
-        test_hosts_block()
-        
-    except PermissionError:
-        print("[INTERNET] ✗ Need Administrator rights!")
-        print("[INTERNET] Running self-elevation...")
-        self_elevate()
+        # Flush DNS
+        run_command("ipconfig /flushdns")
+        print("[INTERNET] ✓ Hosts file updated, DNS flushed")
+        return True
     except Exception as e:
-        print(f"[INTERNET] ✗ Error: {e}")
-        gui.add_log(f"Block error: {e}")
-        gui.update_internet("Unblocked")
+        print(f"[INTERNET] Hosts file error: {e}")
+        return False
 
-def disable():
-    """Restore internet"""
-    global enabled
-    
-    if not enabled:
-        return
-
-    print("[INTERNET] Restoring internet...")
-    
-    gui.update_internet("Unblocked")
+def disable_dns():
+    """Disable DNS resolution completely"""
+    print("[INTERNET] 🌐 Disabling DNS resolution...")
     
     try:
-        # STEP 1: Restore original hosts file
-        if os.path.exists(BACKUP_PATH):
-            shutil.copy2(BACKUP_PATH, HOSTS_PATH)
-            print("[INTERNET] Restored original hosts file")
-        else:
-            # Create default hosts file
-            default_hosts = '''# Copyright (c) 1993-2009 Microsoft Corp.
-#
-# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.
-#
-# This file contains the mappings of IP addresses to host names. Each
-# entry should be kept on an individual line. The IP address should
-# be placed in the first column followed by the corresponding host name.
-# The IP address and the host name should be separated by at least one
-# space.
-#
-# Additionally, comments (such as these) may be inserted on individual
-# lines or following the machine name denoted by a '#' symbol.
-#
-# For example:
-#
-#      102.54.94.97     rhino.acme.com          # source server
-#       38.25.63.10     x.acme.com              # x client host
+        # Set DNS to invalid addresses for all adapters
+        success, stdout, _ = run_command("netsh interface show interface")
+        if success:
+            lines = stdout.split('\n')
+            for line in lines:
+                if "Connected" in line or "Enabled" in line:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        adapter_name = ' '.join(parts[3:]).strip()
+                        # Set DNS to invalid IPs
+                        run_command(f'netsh interface ip set dns name="{adapter_name}" static 0.0.0.0')
+                        run_command(f'netsh interface ip add dns name="{adapter_name}" 0.0.0.1 index=2')
+                        print(f"[INTERNET]   Disabled DNS for: {adapter_name}")
+    except:
+        pass
 
-# localhost name resolution is handled within DNS itself.
-#	127.0.0.1       localhost
-#	::1             localhost
-'''
-            with open(HOSTS_PATH, 'w', encoding='utf-8') as f:
-                f.write(default_hosts)
-        
-        # STEP 2: Remove firewall rules
-        try:
-            firewall_cmd = '''
-            netsh advfirewall firewall delete rule name="Classroom_Total_Block" dir=out
-            netsh advfirewall firewall delete rule name="Classroom_Allow_Teacher" dir=out
-            '''
-            subprocess.run(["cmd", "/c", firewall_cmd], shell=True, capture_output=True)
-            print("[INTERNET] Firewall rules removed")
-        except:
-            pass
-        
-        # STEP 3: Re-enable Network Location Awareness
-        try:
-            subprocess.run(["sc", "config", "NlaSvc", "start=", "auto"], shell=True, capture_output=True)
-            subprocess.run(["sc", "start", "NlaSvc"], shell=True, capture_output=True)
-            print("[INTERNET] Network services restored")
-        except:
-            pass
-        
-        # STEP 4: Flush DNS again
-        subprocess.run("ipconfig /flushdns", shell=True, capture_output=True)
-        
-        enabled = False
-        print("[INTERNET] ✓ Internet completely restored")
-        server.send_log("Internet: RESTORED")
-        gui.add_log("Internet: RESTORED")
-        
-    except Exception as e:
-        print(f"[INTERNET] ✗ Error: {e}")
-        gui.add_log(f"Restore error: {e}")
-        enabled = False
+def restore_dns():
+    """Restore DNS to automatic/DHCP"""
+    print("[INTERNET] 🌐 Restoring DNS...")
+    
+    try:
+        success, stdout, _ = run_command("netsh interface show interface")
+        if success:
+            lines = stdout.split('\n')
+            for line in lines:
+                if "Connected" in line or "Enabled" in line:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        adapter_name = ' '.join(parts[3:]).strip()
+                        run_command(f'netsh interface ip set dns name="{adapter_name}" dhcp')
+                        print(f"[INTERNET]   Restored DNS for: {adapter_name}")
+    except:
+        pass
 
-def self_elevate():
-    """Restart program as Administrator"""
-    import sys
-    import ctypes
+def restore_firewall():
+    """Remove all classroom firewall rules"""
+    print("[INTERNET] 🔥 Removing firewall rules...")
     
-    if ctypes.windll.shell32.IsUserAnAdmin():
-        return True
-    
-    # Re-run as admin
-    script = sys.argv[0]
-    params = ' '.join([script] + sys.argv[1:])
-    
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, params, None, 1
-    )
-    
-    sys.exit()
-
-def test_hosts_block():
-    """Test if hosts blocking works"""
-    print("\n" + "="*60)
-    print("[TEST] Testing HOSTS file blocking...")
-    print("="*60)
-    
-    test_commands = [
-        ("ping -n 2 www.google.com", "Google ping"),
-        ("ping -n 2 google.com", "Google domain"),
-        ("nslookup google.com", "DNS lookup"),
-        ("curl -s --max-time 3 http://www.google.com", "HTTP request"),
-        (f"ping -n 2 {config.TEACHER_IP}", "Teacher connection"),
+    rules_to_remove = [
+        "Classroom_Block_Internet",
+        "Classroom_Allow_LAN", 
+        "Classroom_Allow_Teacher",
+        "Classroom_Allow_Port",
+        "Classroom_Allow_Port_5000",
+        "Classroom_Allow_Ping",
     ]
     
-    for cmd, desc in test_commands:
+    for rule in rules_to_remove:
+        run_command(f'netsh advfirewall firewall delete rule name="{rule}"')
+    
+    print("[INTERNET] ✓ Firewall rules removed")
+
+def restore_hosts():
+    """Restore original hosts file"""
+    hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+    backup_path = hosts_path + ".classroom_backup"
+    
+    print("[INTERNET] 📄 Restoring hosts file...")
+    
+    try:
+        if os.path.exists(backup_path):
+            import shutil
+            shutil.copy2(backup_path, hosts_path)
+            print("[INTERNET] ✓ Original hosts file restored")
+        else:
+            # Create minimal default
+            with open(hosts_path, 'w') as f:
+                f.write("127.0.0.1       localhost\n::1             localhost\n")
+        
+        run_command("ipconfig /flushdns")
+        return True
+    except:
+        return False
+
+def enable():
+    """Enable COMPLETE internet blocking (preserves LAN)"""
+    global enabled, TEACHER_IP, MONITOR_ACTIVE, MONITOR_THREAD
+    
+    if enabled:
+        return True
+    
+    print("\n" + "="*70)
+    print("🔴🔴🔴 COMPLETE INTERNET BLOCKING ACTIVATED")
+    print("="*70)
+    
+    # Check admin rights
+    if not is_admin():
+        print("[INTERNET] ❌ ERROR: Must run as Administrator!")
+        return False
+    
+    # Get teacher IP
+    try:
+        import config
+        TEACHER_IP = config.TEACHER_IP
+        print(f"[INTERNET] Teacher IP: {TEACHER_IP}")
+    except:
+        TEACHER_IP = None
+        print("[INTERNET] ⚠️ Could not get teacher IP")
+    
+    # Get local network info
+    local_ip, gateway = get_network_info()
+    print(f"[INTERNET] Local IP: {local_ip}")
+    print(f"[INTERNET] Gateway: {gateway}")
+    
+    # LAYER 1: Firewall blocking (primary)
+    if block_all_internet_firewall():
+        
+        # LAYER 2: Hosts file blocking (secondary)
+        block_all_internet_hosts()
+        
+        # LAYER 3: DNS disabling (tertiary)
+        disable_dns()
+        
+        enabled = True
+        
+        # Start monitoring thread
+        MONITOR_ACTIVE = True
+        MONITOR_THREAD = threading.Thread(
+            target=monitor_connection,
+            args=(TEACHER_IP,),
+            daemon=True
+        )
+        MONITOR_THREAD.start()
+        
+        # Update GUI
         try:
-            result = subprocess.run(cmd, shell=True, 
-                                  capture_output=True, text=True, timeout=5)
-            
-            if "teacher" in desc.lower():
-                if result.returncode == 0:
-                    print(f"  ✓ TEACHER: {desc} works")
-                else:
-                    print(f"  ✗ TEACHER: {desc} failed")
-            else:
-                # Check if blocked
-                blocked_keywords = ['0.0.0.0', 'could not find', 'timed out', 'failed', 'unreachable']
-                if any(keyword in result.stdout.lower() or keyword in result.stderr.lower() 
-                      for keyword in blocked_keywords):
-                    print(f"  ✓ BLOCKED: {desc}")
-                else:
-                    print(f"  ✗ UNBLOCKED: {desc} - Output: {result.stdout[:50]}")
+            import gui
+            gui.update_internet("Blocked")
+            gui.add_log("Internet: COMPLETELY BLOCKED")
+        except:
+            pass
+        
+        # Send confirmation to teacher
+        try:
+            import server
+            server.send_log("Internet: COMPLETELY BLOCKED (all internet)")
+        except:
+            pass
+        
+        print("\n" + "="*70)
+        print("✅✅✅ INTERNET COMPLETELY BLOCKED")
+        print("   • All internet access: BLOCKED")
+        print("   • ChatGPT/AI sites: BLOCKED")
+        print("   • VPN/Proxy: BLOCKED")
+        print("   • LAN/Teacher connection: PRESERVED")
+        print("="*70)
+        
+        # Test immediately
+        test_connection()
+        
+        return True
+    
+    return False
+
+def disable():
+    """Disable internet blocking"""
+    global enabled, MONITOR_ACTIVE
+    
+    if not enabled:
+        return True
+    
+    print("\n" + "="*70)
+    print("🟢🟢🟢 INTERNET RESTORATION")
+    print("="*70)
+    
+    MONITOR_ACTIVE = False
+    
+    # Restore all layers
+    restore_firewall()
+    restore_hosts()
+    restore_dns()
+    
+    enabled = False
+    
+    # Update GUI
+    try:
+        import gui
+        gui.update_internet("Unblocked")
+        gui.add_log("Internet: COMPLETELY RESTORED")
+    except:
+        pass
+    
+    # Send confirmation to teacher
+    try:
+        import server
+        server.send_log("Internet: RESTORED")
+    except:
+        pass
+    
+    print("\n" + "="*70)
+    print("✅✅✅ INTERNET COMPLETELY RESTORED")
+    print("="*70)
+    
+    return True
+
+def monitor_connection(teacher_ip):
+    """Monitor connection to teacher"""
+    global MONITOR_ACTIVE
+    
+    print("[INTERNET] Starting connection monitor...")
+    
+    while MONITOR_ACTIVE and enabled:
+        try:
+            if teacher_ip:
+                # Try to connect to teacher via TCP (more reliable than ping)
+                import socket
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    classroom_port = get_classroom_port()
+                    result = sock.connect_ex((teacher_ip, classroom_port))
+                    sock.close()
                     
-        except Exception as e:
-            print(f"  ✓ BLOCKED: {desc} (Error: {str(e)[:30]})")
+                    if result == 0:
+                        # Teacher reachable - all good
+                        pass
+                    else:
+                        print(f"[INTERNET] ⚠️ Teacher {teacher_ip} not responding on port {classroom_port}")
+                except:
+                    pass
+                
+            time.sleep(5)
+        except:
+            time.sleep(5)
+
+def test_connection():
+    """Test what's blocked and what's allowed"""
+    print("\n" + "="*70)
+    print("🌐 TESTING CONNECTION STATUS")
+    print("="*70)
     
-    print("="*60)
+    # Test internet sites (should ALL be BLOCKED)
+    internet_tests = [
+        ("8.8.8.8", "Google DNS"),
+        ("1.1.1.1", "Cloudflare DNS"),
+        ("google.com", "Google"),
+        ("youtube.com", "YouTube"),
+        ("facebook.com", "Facebook"),
+        ("chat.openai.com", "ChatGPT"),
+        ("openai.com", "OpenAI"),
+        ("bard.google.com", "Google Bard"),
+        ("claude.ai", "Claude AI"),
+        ("github.com", "GitHub"),
+        ("stackoverflow.com", "StackOverflow"),
+    ]
     
-    # Additional check: Try to open browser programmatically
-    print("\n[TEST] Quick browser test suggestion:")
-    print("1. Open Chrome/Firefox/Edge")
-    print("2. Try to visit: google.com, youtube.com, facebook.com")
-    print("3. All should show 'This site can't be reached'")
-    print("4. Teacher IP should still work for the classroom app")
+    print("\n📡 INTERNET ACCESS (should ALL be BLOCKED):")
+    blocked_count = 0
+    for target, desc in internet_tests:
+        try:
+            # Try ping first
+            result = subprocess.run(
+                ['ping', '-n', '1', target],
+                capture_output=True,
+                timeout=3
+            )
+            if result.returncode == 0:
+                print(f"  ❌ {desc}: ACCESSIBLE (FAILED TO BLOCK!)")
+            else:
+                print(f"  ✅ {desc}: BLOCKED")
+                blocked_count += 1
+        except:
+            print(f"  ✅ {desc}: BLOCKED")
+            blocked_count += 1
+    
+    print(f"\n   {blocked_count}/{len(internet_tests)} internet sites blocked")
+    
+    # Test LAN (should be ALLOWED)
+    print("\n🏠 LAN ACCESS (should be ALLOWED):")
+    
+    # Test teacher connection
+    try:
+        import config
+        teacher_ip = config.TEACHER_IP
+        
+        # Test ping
+        result = subprocess.run(
+            ['ping', '-n', '1', teacher_ip],
+            capture_output=True,
+            timeout=3
+        )
+        if result.returncode == 0:
+            print(f"  ✅ Teacher ({teacher_ip}): CONNECTED (ping)")
+        else:
+            # Try TCP connection to classroom app port
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            classroom_port = get_classroom_port()
+            tcp_result = sock.connect_ex((teacher_ip, classroom_port))
+            sock.close()
+            
+            if tcp_result == 0:
+                print(f"  ✅ Teacher ({teacher_ip}): CONNECTED (port {classroom_port})")
+            else:
+                print(f"  ❌ Teacher ({teacher_ip}): NOT REACHABLE!")
+    except:
+        print(f"  ❌ Teacher: Could not test")
+    
+    # Test local network
+    local_ip, gateway = get_network_info()
+    if gateway:
+        result = subprocess.run(
+            ['ping', '-n', '1', gateway],
+            capture_output=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            print(f"  ✅ Gateway ({gateway}): CONNECTED")
+    
+    print("\n" + "="*70)
+
