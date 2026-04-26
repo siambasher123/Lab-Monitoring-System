@@ -3,7 +3,7 @@ import threading
 import time
 import io
 import queue
-from PIL import ImageGrab
+from PIL import Image, ImageGrab
 import mss
 import mss.tools
 import config
@@ -16,10 +16,27 @@ class ScreenStreamer:
         self.stream_thread = None
         self.image_queue = queue.Queue(maxsize=2)
         self.capture_thread = None
-        self.quality = 15  # VERY LOW quality
-        self.fps = 0.5  # 1 frame every 2 seconds
-        self.screen_width = 600
-        self.screen_height = 300
+        self.quality = 85  # HD-friendly JPEG quality
+        self.fps = 2.0  # 2 frames per second for smoother preview
+        self.screen_width = 1280
+        self.screen_height = 720
+
+    def update_settings(self, quality=None, fps=None, width=None, height=None):
+        """Update streaming settings at runtime."""
+        if quality is not None:
+            self.quality = max(30, min(95, int(quality)))
+        if fps is not None:
+            self.fps = max(0.5, min(5.0, float(fps)))
+        if width is not None:
+            self.screen_width = max(640, min(1920, int(width)))
+        if height is not None:
+            self.screen_height = max(360, min(1080, int(height)))
+
+        print(
+            f"[SCREEN STREAM] Settings updated: "
+            f"{self.screen_width}x{self.screen_height}, "
+            f"Q{self.quality}, {self.fps} FPS"
+        )
         
     def start_streaming(self, teacher_ip):
         """Start streaming screen to teacher"""
@@ -61,43 +78,45 @@ class ScreenStreamer:
     
     def capture_screen(self):
         """Capture screen at regular intervals"""
-        try:
-            from PIL import ImageGrab
-            
-            while self.streaming:
+        frame_interval = 1.0 / max(self.fps, 0.1)
+
+        while self.streaming:
+            frame_start = time.time()
+            try:
+                # mss is faster/more stable for continuous capture on Windows.
+                with mss.mss() as sct:
+                    monitor = sct.monitors[1]
+                    raw = sct.grab(monitor)
+                    screenshot = Image.frombytes("RGB", raw.size, raw.rgb)
+
+                screenshot = screenshot.resize((self.screen_width, self.screen_height), Image.Resampling.LANCZOS)
+
+                img_bytes = io.BytesIO()
+                screenshot.save(
+                    img_bytes,
+                    format='JPEG',
+                    quality=self.quality,
+                    optimize=True,
+                    progressive=False
+                )
+                image_data = img_bytes.getvalue()
+
+                # Keep only latest frame in queue.
                 try:
-                    # SIMPLE CAPTURE: Use ImageGrab directly
-                    screenshot = ImageGrab.grab()
-                    
-                    # Resize to 600x300
-                    screenshot = screenshot.resize((self.screen_width, self.screen_height))
-                    
-                    # Convert to bytes with VERY LOW quality
-                    img_bytes = io.BytesIO()
-                    screenshot.save(img_bytes, format='JPEG', quality=self.quality, optimize=True)
-                    image_data = img_bytes.getvalue()
-                    
-                    print(f"[SCREEN] Captured {len(image_data)} bytes")
-                    
-                    # Put in queue
+                    self.image_queue.put_nowait(image_data)
+                except queue.Full:
                     try:
+                        self.image_queue.get_nowait()
                         self.image_queue.put_nowait(image_data)
-                    except queue.Full:
-                        try:
-                            self.image_queue.get_nowait()
-                            self.image_queue.put_nowait(image_data)
-                        except:
-                            pass
-                    
-                    # Wait 2 seconds
-                    time.sleep(2.0)
-                    
-                except Exception as e:
-                    print(f"[SCREEN] Capture error: {e}")
-                    time.sleep(2.0)
-                    
-        except ImportError:
-            print("[SCREEN] ImageGrab not available")
+                    except:
+                        pass
+
+            except Exception as e:
+                print(f"[SCREEN] Capture error: {e}")
+
+            elapsed = time.time() - frame_start
+            sleep_time = max(0.05, frame_interval - elapsed)
+            time.sleep(sleep_time)
     
     def stream_to_teacher(self):
         """Stream captured images to teacher"""
@@ -123,20 +142,13 @@ class ScreenStreamer:
         if server.connected and server.sock:
             try:
                 data_length = len(image_data)
-                print(f"[SCREEN] Sending image: {data_length} bytes")
                 
                 # CRITICAL FIX: Use LITTLE ENDIAN (Windows standard)
                 length_bytes = data_length.to_bytes(4, 'little', signed=False)
                 
-                # DEBUG: Verify bytes
-                print(f"[SCREEN DEBUG] Length bytes hex: {length_bytes.hex()}")
-                print(f"[SCREEN DEBUG] What teacher will read: {int.from_bytes(length_bytes, 'little')}")
-                
                 # Send length THEN image
                 server.sock.sendall(length_bytes)  # Use sendall for reliability
                 server.sock.sendall(image_data)
-                
-                print(f"[SCREEN] Sent successfully")
                 
             except Exception as e:
                 print(f"[SCREEN] Send error: {e}")
