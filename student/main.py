@@ -1,17 +1,86 @@
-# main.py - STUDENT with cleanup and network monitoring
-# UPDATED: Universal - Works with/without internet, shows network status
+# main.py - STUDENT with PROPER CLEANUP AND GRACEFUL SHUTDOWN  
+# UPDATED: Improved shutdown handling and resource cleanup
 import sys
 import threading
 import atexit
 import time
+import signal
 import config
+
+# Global shutdown flag
+shutdown_flag = False
+connection_thread = None
+
+def cleanup():
+    """Cleanup function called at shutdown"""
+    global shutdown_flag, connection_thread
+    
+    print("\n🧹 Cleaning up student application...")
+    shutdown_flag = True
+    
+    # CRITICAL: End IDE session FIRST to prevent window crashes
+    try:
+        import ide_controller
+        if ide_controller.ide_instance and ide_controller.ide_instance.session_active:
+            print("   ⚠️ IDE session active, ending gracefully...")
+            ide_controller.ide_instance.end_session_early()
+            # Wait a moment for cleanup
+            import time
+            time.sleep(0.5)
+            print("   ✓ IDE session ended")
+    except Exception as e:
+        print(f"   ⚠️ Error ending IDE session: {e}")
+    
+    # End server cleanup
+    try:
+        import server
+        server.cleanup()
+        print("   ✓ Server cleanup complete")
+    except Exception as e:
+        print(f"   ✗ Server cleanup error: {e}")
+    
+    # Restore internet if it was blocked
+    try:
+        import block_internet
+        if hasattr(block_internet, 'enabled') and block_internet.enabled:
+            print("   ⚠️ Internet was blocked, restoring...")
+            block_internet.disable()
+    except:
+        pass
+    
+    # Restore copy-paste if it was blocked
+    try:
+        import block_copy
+        if hasattr(block_copy, 'enabled') and block_copy.enabled:
+            print("   ⚠️ Copy-paste was blocked, restoring...")
+            block_copy.disable()
+    except:
+        pass
+    
+    # Wait for connection thread with timeout
+    if connection_thread and connection_thread.is_alive():
+        print("   ⏳ Waiting for connection thread to stop (max 3 seconds)...")
+        try:
+            connection_thread.join(timeout=3)
+            if connection_thread.is_alive():
+                print("   ⚠️ Connection thread still alive (daemon will stop on exit)")
+        except Exception as e:
+            print(f"   ⚠️ Error joining connection thread: {e}")
+    
+    print("   ✓ Cleanup complete - application exiting")
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n\n⚠️ Interrupt received, shutting down gracefully...")
+    sys.exit(0)
 
 def network_monitor():
     """Monitor network changes and update GUI"""
+    global shutdown_flag
     last_status = None
     last_ip = None
     
-    while True:
+    while not shutdown_flag:
         try:
             # Get current network status
             status = config.get_network_status()
@@ -43,8 +112,11 @@ def network_monitor():
             time.sleep(5)  # Check every 5 seconds
             
         except Exception as e:
-            print(f"[NETWORK MONITOR] Error: {e}")
+            if not shutdown_flag:
+                print(f"[NETWORK MONITOR] Error: {e}")
             time.sleep(10)
+    
+    print("[NETWORK MONITOR] Stopped")
 
 def check_prerequisites():
     """Check if all prerequisites are met before starting"""
@@ -109,6 +181,13 @@ def show_startup_banner():
     print("\n" + "=" * 70)
 
 def main():
+    """Main application entry point"""
+    global shutdown_flag, connection_thread
+    
+    # Register cleanup handlers
+    atexit.register(cleanup)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     # Show startup banner
     show_startup_banner()
     
@@ -156,27 +235,6 @@ def main():
         input("Press Enter to exit...")
         sys.exit(1)
     
-    # Register cleanup function
-    def cleanup():
-        print("\n🧹 Cleaning up student application...")
-        try:
-            server.cleanup()
-            print("   ✓ Server cleanup complete")
-        except Exception as e:
-            print(f"   ✗ Cleanup error: {e}")
-        
-        try:
-            import block_internet
-            if block_internet.enabled:
-                print("   ⚠️ Internet was blocked, restoring...")
-                block_internet.disable()
-        except:
-            pass
-        
-        print("   ✓ Cleanup complete")
-    
-    atexit.register(cleanup)
-    
     # Start GUI
     print("\n🖥️  Starting GUI...")
     try:
@@ -187,15 +245,15 @@ def main():
         input("Press Enter to exit...")
         sys.exit(1)
     
-    # Start network monitor thread
+    # Start network monitor thread (daemon)
     print("📡 Starting network monitor...")
     monitor_thread = threading.Thread(target=network_monitor, daemon=True)
     monitor_thread.start()
     print("   ✓ Network monitor started")
     
-    # Start connection thread
+    # Start connection thread (NON-daemon for graceful shutdown)
     print("🔌 Starting connection manager...")
-    connection_thread = threading.Thread(target=server.connect_to_teacher, daemon=True)
+    connection_thread = threading.Thread(target=server.connect_to_teacher, daemon=False)
     connection_thread.start()
     print("   ✓ Connection manager started")
     
@@ -269,8 +327,10 @@ def main():
         print(f"\n❌ GUI error: {e}")
     finally:
         print("🛑 Shutting down...")
+        shutdown_flag = True
         cleanup()
         print("👋 Goodbye!")
+        sys.exit(0)
 
 if __name__ == "__main__":
     try:

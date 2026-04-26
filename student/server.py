@@ -1,5 +1,6 @@
-# server.py - STUDENT SIDE with parallel command processing 
-# UPDATED: Fixed IDE Control with correct parameters
+# server.py - STUDENT SIDE with parallel command processing and PROPER SHUTDOWN
+# UPDATED: Fixed quiz handling for working quiz_student.py  
+# FIXED: Added graceful shutdown support
 import socket
 import time
 import threading
@@ -41,8 +42,17 @@ _reconnect_event = threading.Event()
 _last_heartbeat = 0
 HEARTBEAT_INTERVAL = 30
 
+# Global shutdown flag
+shutdown_flag = False
+
 def handle_command_async(cmd: str):
     """Handle command in separate thread"""
+    global shutdown_flag
+    
+    if shutdown_flag:
+        print(f"[SERVER] Ignoring command during shutdown: {cmd[:50]}")
+        return
+    
     cmd = cmd.strip()
     
     # CRITICAL DEBUG - This will show EVERY command received
@@ -55,15 +65,25 @@ def handle_command_async(cmd: str):
         print("[STUDENT] Empty command, ignoring")
         return
     
-    # ===== IDE CONTROL COMMANDS (FIXED) =====
+    # ===== IDE CONTROL COMMANDS =====
     if cmd.startswith("LAUNCH_IDE|"):
         print(f"\n💻 [STUDENT] IDE LAUNCH COMMAND RECEIVED")
         try:
-            # Parse format: LAUNCH_IDE|Code::Blocks|15
+            # Parse format:
+            # LAUNCH_IDE|Code::Blocks|15
+            # LAUNCH_IDE|Code::Blocks|15|LOCKPIN:1234
             parts = cmd.split("|")
             if len(parts) >= 3:
                 ide_name = parts[1]
                 duration_str = parts[2]
+                post_session_pin = None
+
+                if len(parts) >= 4 and parts[3].startswith("LOCKPIN:"):
+                    pin_candidate = parts[3][8:].strip()
+                    if pin_candidate.isdigit() and len(pin_candidate) == 4:
+                        post_session_pin = pin_candidate
+                    else:
+                        print(f"[IDE] Invalid LOCKPIN value received: '{pin_candidate}'")
                 
                 # Parse duration safely
                 try:
@@ -74,12 +94,15 @@ def handle_command_async(cmd: str):
                 
                 print(f"[IDE] Launching: {ide_name} for {duration} min")
                 
-                # Start IDE session with JUST 2 parameters (ide_name, duration)
+                # Start IDE session (optional post-session lock PIN)
                 threading.Thread(target=ide_controller.ide_instance.start_session,
-                               args=(ide_name, duration),
+                               args=(ide_name, duration, post_session_pin),
                                daemon=True).start()
                 
-                gui.add_log(f"IDE launched: {ide_name} ({duration} min)")
+                if post_session_pin:
+                    gui.add_log(f"IDE launched: {ide_name} ({duration} min) | Post-lock enabled")
+                else:
+                    gui.add_log(f"IDE launched: {ide_name} ({duration} min)")
                 return
         except Exception as e:
             print(f"[IDE] Error: {e}")
@@ -164,13 +187,16 @@ def handle_command_async(cmd: str):
                 print(f"[STUDENT] Remote input error: {e}")
         return
     
-    # ===== QUIZ COMMANDS =====
+    # In server.py, replace the quiz commands section with:
+
+    # ===== QUIZ COMMANDS - FIXED FOR WORKING QUIZ_STUDENT.PY =====
     elif cmd.startswith("QUIZ_START:"):
         print(f"\n📝 [STUDENT] QUIZ_START command received")
         if QUIZ_AVAILABLE:
             try:
+                # Format: QUIZ_START:quiz_id|duration|q_per_student|marks_correct|marks_wrong
                 parts = cmd[11:].split('|')
-                if len(parts) == 5:
+                if len(parts) >= 5:
                     quiz_id = parts[0]
                     duration = int(parts[1])
                     q_per_student = int(parts[2])
@@ -178,18 +204,40 @@ def handle_command_async(cmd: str):
                     marks_wrong = int(parts[4])
                     
                     print(f"[QUIZ] Starting quiz: {quiz_id}")
-                    quiz_student.student_quiz.show_quiz(quiz_id, duration, q_per_student, marks_correct, marks_wrong)
+                    print(f"[QUIZ] Duration: {duration} min, Questions per student: {q_per_student}")
+                    print(f"[QUIZ] Marks: +{marks_correct}/-{marks_wrong}")
+                    
+                    # IMPORTANT: Clear previous quiz data
+                    if hasattr(quiz_student, 'student_quiz'):
+                        quiz_student.student_quiz.questions = []
+                        quiz_student.student_quiz.answers = {}
+                    
+                    # Show quiz in the main thread
+                    if gui.root_window:
+                        gui.root_window.after(0, lambda: quiz_student.student_quiz.show_quiz(
+                            quiz_id, duration, q_per_student, marks_correct, marks_wrong
+                        ))
+                    
                     gui.add_log(f"Quiz started: {quiz_id}")
             except Exception as e:
                 print(f"[QUIZ] Error starting quiz: {e}")
+                import traceback
+                traceback.print_exc()
         return
         
     elif cmd.startswith("QUIZ_QUESTION:"):
         if QUIZ_AVAILABLE:
             try:
-                q_data = cmd[14:]
+                # Extract question data
+                q_data = cmd[14:]  # Remove "QUIZ_QUESTION:"
                 print(f"[QUIZ] Adding question: {q_data[:50]}...")
-                quiz_student.student_quiz.add_question(q_data)
+                
+                # Pass directly to student_quiz
+                if hasattr(quiz_student, 'student_quiz') and quiz_student.student_quiz:
+                    quiz_student.student_quiz.add_question(q_data)
+                else:
+                    print(f"[QUIZ] Quiz object not initialized yet")
+                    
             except Exception as e:
                 print(f"[QUIZ] Error adding question: {e}")
         return
@@ -198,20 +246,13 @@ def handle_command_async(cmd: str):
         if QUIZ_AVAILABLE:
             try:
                 gui.add_log("Quiz time is up!")
-                if quiz_student.student_quiz.quiz_active:
-                    quiz_student.student_quiz.time_up()
+                if hasattr(quiz_student, 'student_quiz') and quiz_student.student_quiz:
+                    if quiz_student.student_quiz.quiz_active:
+                        if gui.root_window:
+                            # Force time up immediately
+                            gui.root_window.after(0, quiz_student.student_quiz.force_time_up)
             except Exception as e:
                 print(f"[QUIZ] Error handling time up: {e}")
-        return
-        
-    elif cmd == "QUIZ_STOPPED":
-        if QUIZ_AVAILABLE:
-            try:
-                gui.add_log("Quiz stopped by teacher")
-                if quiz_student.student_quiz.quiz_active:
-                    quiz_student.student_quiz.close_quiz()
-            except Exception as e:
-                print(f"[QUIZ] Error stopping quiz: {e}")
         return
     
     # ===== PING COMMAND (Heartbeat) =====
@@ -288,6 +329,26 @@ def handle_command_async(cmd: str):
     elif cmd.startswith("REFRESH_SCREEN:"):
         print("[SCREEN] Refresh requested")
         gui.add_log("Screen refresh requested")
+
+    elif cmd.startswith("SET_STREAM_QUALITY:"):
+        payload = cmd[19:]
+        try:
+            quality_str, fps_str, width_str, height_str = payload.split('|', 3)
+            quality = int(float(quality_str))
+            fps = float(fps_str)
+            width = int(float(width_str))
+            height = int(float(height_str))
+
+            import screen_stream
+            screen_stream.screen_streamer.update_settings(
+                quality=quality,
+                fps=fps,
+                width=width,
+                height=height,
+            )
+            gui.add_log(f"Stream quality updated: {width}x{height}, Q{quality}, {fps} FPS")
+        except Exception as e:
+            print(f"[SCREEN] Invalid stream quality command: {payload} ({e})")
     
     # Copy-paste blocking
     elif cmd == "BLOCK":
@@ -374,7 +435,7 @@ def check_teacher_reachable():
 
 def connect_to_teacher():
     """Connect to teacher with auto-reconnect and network change detection"""
-    global connected, sock
+    global connected, sock, shutdown_flag
     
     # Show network status at start
     network_status = config.get_network_status()
@@ -382,24 +443,32 @@ def connect_to_teacher():
     print(f"📡 Local IP: {network_status['local_ip']}")
     print(f"🎯 Teacher IP: {config.TEACHER_IP}")
     
-    while True:
-        if not connected:
+    while not shutdown_flag:
+        if not connected and not shutdown_flag:
             try:
                 # First check if teacher is reachable
                 reachable, method = check_teacher_reachable()
                 if not reachable:
-                    print(f"\n[CONNECTION] ⚠️ Teacher {config.TEACHER_IP} not reachable")
-                    print("[CONNECTION] Make sure:")
-                    print("  1. Teacher PC is on and running the app")
-                    print("  2. Both PCs are on the same network")
-                    print("  3. Firewall allows port 5000")
+                    if not shutdown_flag:
+                        print(f"\n[CONNECTION] ⚠️ Teacher {config.TEACHER_IP} not reachable")
+                        print("[CONNECTION] Make sure:")
+                        print("  1. Teacher PC is on and running the app")
+                        print("  2. Both PCs are on the same network")
+                        print("  3. Firewall allows port 5000")
                     
                     # Wait before retry
                     for i in range(5, 0, -1):
+                        if shutdown_flag:
+                            print("[CONNECTION] Shutdown during retry wait")
+                            return
                         print(f"[CONNECTION] Retrying in {i} seconds...", end='\r')
                         time.sleep(1)
                     print()
                     continue
+                
+                if shutdown_flag:
+                    print("[CONNECTION] Shutdown requested during connection attempt")
+                    return
                 
                 gui.update_status("trying")
                 print(f"\n[CONNECTION] Connecting to teacher at {config.TEACHER_IP}:{config.PORT}...")
@@ -423,7 +492,7 @@ def connect_to_teacher():
                 # Buffer for incomplete messages
                 buffer = ""
                 
-                while connected:
+                while connected and not shutdown_flag:
                     try:
                         data = sock.recv(8192)
                         if not data:
@@ -451,18 +520,22 @@ def connect_to_teacher():
                                 handle_command(line)
                         
                     except socket.timeout:
+                        if shutdown_flag:
+                            print("[CONNECTION] Shutdown during socket read")
+                            break
                         continue
                     except Exception as e:
-                        connected = False
-                        gui.update_status("disconnected")
-                        print(f"[CONNECTION] ✗ Connection lost: {e}")
-                        
-                        # Check if teacher is still reachable
-                        reachable, _ = check_teacher_reachable()
-                        if reachable:
-                            print("[CONNECTION] Teacher still reachable, reconnecting...")
-                        else:
-                            print("[CONNECTION] Teacher not reachable, waiting...")
+                        if not shutdown_flag:
+                            connected = False
+                            gui.update_status("disconnected")
+                            print(f"[CONNECTION] ✗ Connection lost: {e}")
+                            
+                            # Check if teacher is still reachable
+                            reachable, _ = check_teacher_reachable()
+                            if reachable and not shutdown_flag:
+                                print("[CONNECTION] Teacher still reachable, reconnecting...")
+                            else:
+                                print("[CONNECTION] Teacher not reachable, waiting...")
                         
                         try:
                             sock.close()
@@ -471,20 +544,38 @@ def connect_to_teacher():
                         break
                         
             except Exception as e:
-                connected = False
-                gui.update_status("trying")
-                print(f"[CONNECTION] ✗ Connection failed: {e}")
+                if not shutdown_flag:
+                    connected = False
+                    gui.update_status("trying")
+                    print(f"[CONNECTION] ✗ Connection failed: {e}")
                 try:
                     if sock:
                         sock.close()
                 except:
                     pass
             
+            if shutdown_flag:
+                print("[CONNECTION] Shutdown requested, exiting connection loop")
+                break
+            
             # Progressive backoff retry
             for i in range(3, 0, -1):
+                if shutdown_flag:
+                    print("[CONNECTION] Shutdown during backoff")
+                    return
                 print(f"[CONNECTION] Retrying in {i} seconds...", end='\r')
                 time.sleep(1)
             print()
+    
+    # Cleanup on shutdown
+    print("[CONNECTION] Closing connection...")
+    if sock:
+        try:
+            sock.close()
+        except:
+            pass
+    connected = False
+    print("[CONNECTION] Connection thread stopped")
 
 def send_log(message):
     """Send log message to teacher"""
@@ -496,14 +587,13 @@ def send_log(message):
         except Exception as e:
             print(f"[STUDENT] Failed to send log: {e}")
 
-def send_quiz_submission(quiz_id, student_number, answers):
+def send_quiz_submission(quiz_id, student_roll, answers_json):
     """Send quiz answers to teacher"""
     if connected and sock:
         try:
-            answers_json = json.dumps(answers)
-            full_message = f"LOG QUIZ_SUBMIT:{quiz_id}|{student_number}|{answers_json}\n"
+            full_message = f"LOG QUIZ_SUBMIT:{quiz_id}|{student_roll}|{answers_json}\n"
             sock.send(full_message.encode())
-            print(f"[QUIZ] Submitted {len(answers)} answers for student {student_number}")
+            print(f"[QUIZ] Submitted answers for student {student_roll}")
             return True
         except Exception as e:
             print(f"[QUIZ] Error submitting: {e}")
@@ -512,36 +602,61 @@ def send_quiz_submission(quiz_id, student_number, answers):
 
 def cleanup():
     """Cleanup resources"""
-    global executor
+    global executor, shutdown_flag, sock, connected
     
-    print("\n[STUDENT] Cleaning up...")
+    print("\n[STUDENT SERVER] Cleaning up...")
+    shutdown_flag = True
+    
+    # CRITICAL: End IDE session FIRST - this is most important
+    try:
+        if ide_controller.ide_instance and ide_controller.ide_instance.session_active:
+            print("[STUDENT SERVER] ⚠️ IDE session active, ending gracefully...")
+            ide_controller.ide_instance.end_session_early()  # Use early end to ensure cleanup
+            # Give it time to finish
+            import time
+            time.sleep(0.5)
+            print("[STUDENT SERVER] ✓ IDE session ended")
+    except Exception as e:
+        print(f"[STUDENT SERVER] Error ending IDE session: {e}")
     
     # Stop remote control if active
     if REMOTE_CONTROL_AVAILABLE:
         try:
             remote_control.remote_control.stop()
+            print("[STUDENT SERVER] ✓ Remote control stopped")
         except:
             pass
     
     # Close quiz if active
     if QUIZ_AVAILABLE:
         try:
-            if quiz_student.student_quiz.quiz_active:
-                quiz_student.student_quiz.close_quiz()
+            if hasattr(quiz_student, 'student_quiz') and quiz_student.student_quiz:
+                if quiz_student.student_quiz.quiz_active:
+                    if (hasattr(quiz_student.student_quiz, 'window') and 
+                        quiz_student.student_quiz.window and 
+                        quiz_student.student_quiz.window.winfo_exists()):
+                        quiz_student.student_quiz.window.quit()
+                        quiz_student.student_quiz.window.destroy()
+            print("[STUDENT SERVER] ✓ Quiz closed")
         except:
             pass
-    
-    # Stop IDE session if active - FIXED
-    try:
-        ide_controller.ide_instance.end_session()
-    except:
-        pass
     
     # Close socket
     if sock:
         try:
             sock.close()
+            print("[STUDENT SERVER] ✓ Socket closed")
         except:
             pass
     
-    print("[STUDENT] Cleanup complete")
+    connected = False
+    
+    # Shutdown thread pool
+    try:
+        print("[STUDENT SERVER] Shutting down thread pool...")
+        executor.shutdown(wait=False)
+        print("[STUDENT SERVER] ✓ Thread pool shut down")
+    except:
+        pass
+    
+    print("[STUDENT SERVER] Cleanup complete")
